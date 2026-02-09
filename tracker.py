@@ -1,88 +1,315 @@
+import flet as ft
 import asyncio
 import random
-import time
-import httpx  # Use httpx for async requests
-from playwright.async_api import async_playwright
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
+from playwright.async_api import async_playwright
+import httpx
 
-# --- CONFIGURATION ---
+# Load existing config
 load_dotenv()
 
-PRODUCT_URL = "https://www.amazon.eg/-/en/Lexar-LNM620X256G-RNNNG-Internal-Maximum-500MB/dp/B0C3LXWXVR"
-
-"""
-"https://www.amazon.eg/-/en/Lexar-LNM620X256G-RNNNG-Internal-Maximum-500MB/dp/B0C3LXWXVR"
-"https://www.amazon.eg/-/en/WD_BLACK-SN850X-Internal-Gaming-Solid/dp/B0B7CKVCCV"
-"""
-TARGET_PRICE = 6000
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = "929550853"
-CHECK_INTERVAL = 5 * 60  # Check every 5 minutes
-
-async def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
+async def send_telegram(message, token, chat_id):
+    """Send a message to Telegram"""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message}
     async with httpx.AsyncClient() as client:
         await client.post(url, data=payload)
-async def get_price(page):
-    try:
-        print(f"[{time.strftime('%H:%M:%S')}] Checking price for Item...")
-        await page.goto(PRODUCT_URL, wait_until="domcontentloaded")
-        # 1. Check if the "See All Buying Options" button exists
-        # If this button is there, Amazon isn't selling it directly right now.
-        buying_options_btn = await page.query_selector("#buybox-see-all-buying-choices")
-        if buying_options_btn:
-            print("Status: Only available from third-party sellers (Buying Options).")
-            return None
-        # 2. Check if it's explicitly Out of Stock
-        out_of_stock_text = await page.query_selector("#outOfStock")
-        if out_of_stock_text:
-            print("Status: Currently out of stock.")
-            return None
-        # 3. Targeted Search: Look ONLY in the main product section
-        # We use #apex_desktop which is the container for the main price and title
-        main_container = await page.query_selector("#apex_desktop")
-        if main_container:
-            # Grab price components: whole, decimal, fraction
-            whole = await main_container.query_selector(".a-price-whole")
-            fraction = await main_container.query_selector(".a-price-fraction")
+
+class TrackerGUI:
+    def __init__(self):
+        self.is_running = False
+        self.browser = None
+        self.context = None
+        self.price_history = []  # Store last 10 prices for trend analysis
+        self.consecutive_failures = 0
+        self.max_failures = 3  # Stop after 3 consecutive errors
+        
+    async def start_tracking(self, e):
+        url = self.url_input.value.strip()
+        target_price = self.target_price_input.value.strip()
+        token = self.telegram_token_input.value.strip()
+        chat_id = self.chat_id_input.value.strip()
+        interval = self.interval_input.value.strip()
+        
+        # Validation
+        if not url or not target_price or not token or not chat_id or not interval:
+            self.status_text.value = "❌ Please fill all fields"
+            self.page.update()
+            return
             
-            if whole and fraction:
-                whole_text = await whole.inner_text()
-                #fraction_text = await fraction.inner_text()
-                # Clean up: whole has format "3,003." so remove comma and period
-                clean_price = "".join(c for c in whole_text if c.isdigit() or c == '.')
-                #price = f"{clean_price}{fraction_text}
-                return float(clean_price)
+        try:
+            target_price = float(target_price)
+            interval = int(interval)
+        except ValueError:
+            self.status_text.value = "❌ Invalid price or interval"
+            self.page.update()
+            return
+        
+        # Save settings to .env
+        set_key(".env", "PRODUCT_URL", url)
+        set_key(".env", "TARGET_PRICE", str(target_price))
+        set_key(".env", "TELEGRAM_TOKEN", token)
+        set_key(".env", "CHAT_ID", chat_id)
+        set_key(".env", "CHECK_INTERVAL", str(interval))
+        
+        self.is_running = True
+        self.start_button.disabled = True
+        self.stop_button.disabled = False
+        self.status_text.value = "✅ Tracker started..."
+        self.page.update()
+        
+        # Start tracking loop
+        await self.run_tracker(url, target_price, token, chat_id, interval)
+    
+    async def run_tracker(self, url, target_price, token, chat_id, interval):
+        async with async_playwright() as p:
+            try:
+                self.browser = await p.chromium.launch(headless=True)
+                self.context = await self.browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+                self.price_history = []
+                self.consecutive_failures = 0
+                
+                while self.is_running:
+                    try:
+                        page = await self.context.new_page()
+                        
+                        # Scrape price
+                        await page.goto(url, wait_until="domcontentloaded")
+                        
+                        # Check if only available from third-party sellers
+                        buying_options_btn = await page.query_selector("#buybox-see-all-buying-choices")
+                        if buying_options_btn:
+                            self.status_text.value = "⚠️ Only available from third-party sellers"
+                            self.log_text.value += "Only available from third-party sellers\n"
+                            await page.close()
+                            self.consecutive_failures = 0
+                            wait_time = random.uniform(interval * 0.8, interval * 1.2)
+                            await self.countdown_sleep(wait_time)
+                            continue
+                        
+                        # Check if out of stock
+                        out_of_stock_text = await page.query_selector("#outOfStock")
+                        if out_of_stock_text:
+                            self.status_text.value = "❌ Out of stock"
+                            self.log_text.value += "Out of stock\n"
+                            await page.close()
+                            self.consecutive_failures = 0
+                            wait_time = random.uniform(interval * 0.8, interval * 1.2)
+                            await self.countdown_sleep(wait_time)
+                            continue
+                        
+                        main_container = await page.query_selector("#apex_desktop")
+                        
+                        if main_container:
+                            whole = await main_container.query_selector(".a-price-whole")
+                            if whole:
+                                whole_text = await whole.inner_text()
+                                clean_price = "".join(c for c in whole_text if c.isdigit() or c == '.')
+                                current_price = float(clean_price)
+                                
+                                # Track price history and show trend
+                                self.price_history.append(current_price)
+                                if len(self.price_history) > 10:
+                                    self.price_history.pop(0)
+                                
+                                trend = self.get_price_trend()
+                                self.log_text.value += f"Current Price: {current_price} EGP {trend}\n"
+                                self.consecutive_failures = 0
+                                
+                                if current_price <= target_price:
+                                    self.status_text.value = f"🚨 PRICE DROP! {current_price} EGP"
+                                    await send_telegram(f"🚨 PRICE DROP! {current_price} EGP\nBuy now: {url}", token, chat_id)
+                                else:
+                                    self.status_text.value = f"Price: {current_price} EGP (Target: {target_price}) {trend}"
+                            else:
+                                self.status_text.value = "⚠️ Item unavailable"
+                                self.log_text.value += "Item unavailable or out of stock\n"
+                                self.consecutive_failures = 0
+                        
+                        await page.close()
+                        
+                    except Exception as ex:
+                        self.consecutive_failures += 1
+                        self.log_text.value += f"Error: {str(ex)} [Attempt {self.consecutive_failures}/{self.max_failures}]\n"
+                        
+                        if self.consecutive_failures >= self.max_failures:
+                            self.status_text.value = f"🛑 Stopped: Too many errors ({self.max_failures})"
+                            self.log_text.value += f"\n⚠️ Tracker stopped due to {self.max_failures} consecutive errors\n"
+                            self.is_running = False
+                        else:
+                            wait_time = random.uniform(interval * 0.8, interval * 1.2)
+                            await self.countdown_sleep(wait_time)
+                            continue
+                    
+                    # Keep last 20 lines
+                    lines = self.log_text.value.split('\n')
+                    if len(lines) > 20:
+                        self.log_text.value = '\n'.join(lines[-20:])
+                    
+                    self.page.update()
+                    wait_time = random.uniform(interval * 0.8, interval * 1.2)
+                    await self.countdown_sleep(wait_time)
             
-        print("Status: Main price not found (likely unavailable).")
-        return None
-
-    except Exception as e:
-        print(f"Error during check: {e}")
-        return None
-
-
-
-async def main():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            finally:
+                # Graceful cleanup - always close browser
+                if self.context:
+                    await self.context.close()
+                if self.browser:
+                    await self.browser.close()
+                self.context = None
+                self.browser = None
+    
+    def stop_tracking(self, e):
+        self.is_running = False
+        self.start_button.disabled = False
+        self.stop_button.disabled = True
+        self.status_text.value = "⏹️ Tracker stopped"
+        self.page.update()
+    
+    async def countdown_sleep(self, duration):
+        """Sleep while showing countdown in status"""
+        for remaining in range(int(duration), 0, -1):
+            if not self.is_running:
+                break
+            self.status_text.value = f"Next check in {remaining}s..."
+            self.page.update()
+            await asyncio.sleep(1)
+    
+    def get_price_trend(self):
+        """Analyze price history and return trend indicator"""
+        if len(self.price_history) < 2:
+            return ""
+        
+        current = self.price_history[-1]
+        previous = self.price_history[-2]
+        
+        if current < previous:
+            return "📉"
+        elif current > previous:
+            return "📈"
+        else:
+            return "→"
+    
+    def on_window_close(self, e):
+        """Handle graceful shutdown when window closes"""
+        self.is_running = False
+    
+    def build(self, page):
+        self.page = page
+        page.title = "Amazon Price Tracker"
+        page.window.width = 700
+        page.window.height = 800
+        
+        # Handle window close event for graceful shutdown
+        page.on_close = self.on_window_close
+        
+        # Get existing values
+        existing_url = os.getenv("PRODUCT_URL", "")
+        existing_target = os.getenv("TARGET_PRICE", "5000")
+        existing_token = os.getenv("TELEGRAM_TOKEN", "")
+        existing_chat_id = os.getenv("CHAT_ID", "")
+        existing_interval = os.getenv("CHECK_INTERVAL", "300")
+        
+        # Title
+        title = ft.Text("Amazon Price Tracker", size=24, weight="bold")
+        
+        # URL Input
+        self.url_input = ft.TextField(
+            label="Amazon URL",
+            value=existing_url,
+            multiline=True,
+            min_lines=2,
         )
-        while True:
-            page = await context.new_page()
-            current_price = await get_price(page)
-            if current_price:
-                print(f"Current Price: {current_price} EGP")
-                if current_price <= TARGET_PRICE:
-                    await send_telegram(f"🚨 PRICE DROP! {current_price} EGP\nBuy now: {PRODUCT_URL}")
-                    print("Alert sent!")
+        
+        # Target Price Input
+        self.target_price_input = ft.TextField(
+            label="Target Price (EGP)",
+            value=existing_target,
+            keyboard_type="number",
+        )
+        
+        # Telegram Token Input
+        self.telegram_token_input = ft.TextField(
+            label="Telegram Bot Token",
+            value=existing_token,
+            password=True,
+        )
+        
+        # Chat ID Input
+        self.chat_id_input = ft.TextField(
+            label="Telegram Chat ID",
+            value=existing_chat_id,
+        )
+        
+        # Interval Input
+        self.interval_input = ft.TextField(
+            label="Check Interval (seconds)",
+            value=existing_interval,
+            keyboard_type="number",
+        )
+        interval_help = ft.Text("Recommended: 300 (5 min), 600 (10 min)", size=11, color="grey")
+        
+        # Status Text
+        self.status_text = ft.Text("Ready", size=14, color="blue")
+        
+        # Log Text
+        self.log_text = ft.Text("", size=10, selectable=True)
+        log_container = ft.Container(
+            content=ft.Column([self.log_text], scroll="auto"),
+            height=200,
+            border=ft.Border.all(1, "grey"),
+            padding=10,
+        )
+        
+        # Buttons
+        self.start_button = ft.Button(
+            "Start Tracking",
+            on_click=self.start_tracking,
+            bgcolor="green",
+            color="white",
+        )
+        
+        self.stop_button = ft.Button(
+            "Stop Tracking",
+            on_click=self.stop_tracking,
+            disabled=True,
+            bgcolor="red",
+            color="white",
+        )
+        
+        button_row = ft.Row([self.start_button, self.stop_button], spacing=10)
+        
+        # Layout
+        content = ft.Column([
+            title,
+            ft.Divider(),
+            self.url_input,
+            self.target_price_input,
+            self.telegram_token_input,
+            self.chat_id_input,
+            self.interval_input,
+            interval_help,
+            button_row,
+            ft.Divider(),
+            ft.Text("Status:", weight="bold"),
+            self.status_text,
+            ft.Text("Logs:", weight="bold"),
+            log_container,
+        ], spacing=10, scroll="auto")
+        
+        page.add(
+            ft.Container(
+                content=content,
+                padding=20,
+            )
+        )
 
-            await page.close() # Close page but keep browser open
-            wait_time = random.uniform(CHECK_INTERVAL * 0.8, CHECK_INTERVAL * 1.2)
-            print(f"Waiting {int(wait_time)}s for next check...")
-            await asyncio.sleep(wait_time)
+def main(page: ft.Page):
+    gui = TrackerGUI()
+    gui.build(page)
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    ft.run(main)
