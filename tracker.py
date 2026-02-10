@@ -57,6 +57,8 @@ class TrackerGUI:
         self.start_button.disabled = True
         self.stop_button.disabled = False
         self.status_text.value = "✅ Tracker started..."
+        self.price_history_text.value = "Price History: N/A"
+        self.log_text.value = ""
         self.page.update()
         
         # Start tracking loop
@@ -115,13 +117,21 @@ class TrackerGUI:
                                 if len(self.price_history) > 10:
                                     self.price_history.pop(0)
                                 
+                                # Update price history display
+                                history_display = " → ".join([f"{p:.0f}" for p in self.price_history])
+                                self.price_history_text.value = f"Price History (EGP): {history_display}"
+                                
                                 trend = self.get_price_trend()
                                 self.log_text.value += f"Current Price: {current_price} EGP {trend}\n"
                                 self.consecutive_failures = 0
                                 
                                 if current_price <= target_price:
                                     self.status_text.value = f"🚨 PRICE DROP! {current_price} EGP"
+                                    self.log_text.value += f"🚨 ALERT: Price dropped to {current_price} EGP! Tracker stopped.\n"
                                     await send_telegram(f"🚨 PRICE DROP! {current_price} EGP\nBuy now: {url}", token, chat_id)
+                                    self.is_running = False
+                                    self.start_button.disabled = False
+                                    self.stop_button.disabled = True
                                 else:
                                     self.status_text.value = f"Price: {current_price} EGP (Target: {target_price}) {trend}"
                             else:
@@ -169,6 +179,10 @@ class TrackerGUI:
         self.status_text.value = "⏹️ Tracker stopped"
         self.page.update()
     
+    def clear_logs(self, e):
+        self.log_text.value = ""
+        self.page.update()
+    
     async def countdown_sleep(self, duration):
         """Sleep while showing countdown in status"""
         for remaining in range(int(duration), 0, -1):
@@ -200,8 +214,8 @@ class TrackerGUI:
     def build(self, page):
         self.page = page
         page.title = "Amazon Price Tracker"
-        page.window.width = 700
-        page.window.height = 800
+        page.window.width = 900
+        page.window.height = 1000
         
         # Handle window close event for graceful shutdown
         page.on_close = self.on_window_close
@@ -255,11 +269,14 @@ class TrackerGUI:
         # Status Text
         self.status_text = ft.Text("Ready", size=14, color="blue")
         
+        # Price History Display
+        self.price_history_text = ft.Text("Price History: N/A", size=11, color="grey")
+        
         # Log Text
         self.log_text = ft.Text("", size=10, selectable=True)
         log_container = ft.Container(
             content=ft.Column([self.log_text], scroll="auto"),
-            height=200,
+            height=350,
             border=ft.Border.all(1, "grey"),
             padding=10,
         )
@@ -280,10 +297,17 @@ class TrackerGUI:
             color="white",
         )
         
+        self.clear_button = ft.Button(
+            "Clear Logs",
+            on_click=self.clear_logs,
+            bgcolor="grey",
+            color="white",
+        )
+        
         button_row = ft.Row([self.start_button, self.stop_button], spacing=10)
         
-        # Layout
-        content = ft.Column([
+        # Left Column - Input Fields
+        left_column = ft.Column([
             title,
             ft.Divider(),
             self.url_input,
@@ -293,17 +317,34 @@ class TrackerGUI:
             self.interval_input,
             interval_help,
             button_row,
-            ft.Divider(),
+        ], spacing=10, scroll="auto", width=400)
+        
+        # Right Column - Status and Logs
+        logs_header = ft.Row([
+            ft.Text("Logs:", weight="bold"),
+            self.clear_button,
+        ], spacing=10)
+        
+        right_column = ft.Column([
             ft.Text("Status:", weight="bold"),
             self.status_text,
-            ft.Text("Logs:", weight="bold"),
+            self.price_history_text,
+            logs_header,
             log_container,
-        ], spacing=10, scroll="auto")
+        ], spacing=10, scroll="auto", expand=True)
+        
+        # Layout - Horizontal
+        content = ft.Row([
+            left_column,
+            ft.VerticalDivider(),
+            right_column,
+        ], spacing=10, expand=True)
         
         page.add(
             ft.Container(
                 content=content,
                 padding=20,
+                expand=True,
             )
         )
 
